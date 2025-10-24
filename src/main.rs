@@ -1,7 +1,8 @@
-use tokio::{net::TcpListener};
+use tokio::{io::BufStream, net::TcpListener};
 use tracing::info;
 
 mod req;
+mod utils;
 
 static DEFAULT_PORT: &str = "8080";
 
@@ -20,9 +21,18 @@ async fn main() -> Result<(), Box<(dyn std::error::Error + 'static)>> {
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        let mut stream = BufStream::new(stream);
 
         tokio::spawn(async move {
             info!(?addr, "new connection");
+
+            match req::parse_request(&mut stream).await {
+                Ok(req) => info!(?req, "incoming request"),
+                Err(e) => {
+                    info!(?e, "failed to parse request");
+                }
+            }
+
         });
     }
 }
