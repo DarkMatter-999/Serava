@@ -86,9 +86,7 @@ impl From<std::io::Error> for ParseError {
     }
 }
 
-pub async fn parse_request(
-    mut stream: impl AsyncBufRead + Unpin,
-) -> Result<Request, ParseError> {
+pub async fn parse_request(mut stream: impl AsyncBufRead + Unpin) -> Result<Request, ParseError> {
     let mut line_buffer = String::new();
     stream.read_line(&mut line_buffer).await?;
 
@@ -121,10 +119,7 @@ pub async fn parse_request(
 
         let mut comps = line_buffer.splitn(2, ':');
         let key = comps.next().ok_or(ParseError::MissingHeaderName)?;
-        let value = comps
-            .next()
-            .ok_or(ParseError::MissingHeaderValue)?
-            .trim();
+        let value = comps.next().ok_or(ParseError::MissingHeaderValue)?.trim();
 
         headers.insert(key.to_string(), value.to_string());
     }

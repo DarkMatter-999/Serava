@@ -2,7 +2,7 @@ use tokio::{io::BufStream, net::TcpListener};
 use tracing::info;
 
 mod req;
-mod utils;
+mod resp;
 
 static DEFAULT_PORT: &str = "8080";
 
@@ -33,6 +33,12 @@ async fn main() -> Result<(), Box<(dyn std::error::Error + 'static)>> {
                 }
             }
 
+            let resp = resp::Response::from_html(
+                resp::Status::NotFound,
+                include_str!("../static/404.html"),
+            );
+
+            resp.write(&mut stream).await.unwrap();
         });
     }
 }
