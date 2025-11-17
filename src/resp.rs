@@ -14,6 +14,8 @@ pub struct Response<S: AsyncRead + Unpin> {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum Status {
+    InternalServerError,
+    BadRequest,
     NotFound,
 }
 
@@ -44,6 +46,8 @@ impl Display for Status {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Status::NotFound => write!(f, "404 Not Found"),
+            Status::BadRequest => write!(f, "400 Bad Request"),
+            Status::InternalServerError => write!(f, "500 Internal Server Error"),
         }
     }
 }

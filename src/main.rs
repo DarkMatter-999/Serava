@@ -2,8 +2,10 @@ use tokio::{io::BufStream, net::TcpListener};
 use tracing::info;
 
 mod config;
+mod proxy;
 mod req;
 mod resp;
+mod r#static;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<(dyn std::error::Error + 'static)>> {
@@ -47,21 +49,47 @@ async fn main() -> Result<(), Box<(dyn std::error::Error + 'static)>> {
         let (stream, addr) = listener.accept().await?;
         let mut stream = BufStream::new(stream);
         let not_found_html = not_found_html.clone();
+        let static_dir = cfg.static_dir.clone();
+        let backends = cfg.backends.clone();
 
         tokio::spawn(async move {
             info!(?addr, "new connection");
 
             match req::parse_request(&mut stream).await {
-                Ok(req) => info!(?req, "incoming request"),
+                Ok(req) => {
+                    info!(?req, "incoming request");
+
+                    // ROUTING: /static/... -> static handler; else -> proxy handler
+                    if req.path.starts_with("/static/") && req::Method::Get == req.method {
+                        if let Err(e) =
+                            r#static::handle(&mut stream, &req, static_dir, &not_found_html).await
+                        {
+                            info!(?e, "static handler error");
+                            let _ = resp::Response::from_html(
+                                resp::Status::InternalServerError,
+                                "Internal server error",
+                            )
+                            .write(&mut stream)
+                            .await;
+                        }
+                    } else {
+                        if let Err(e) = proxy::handle(&mut stream, &req, &backends).await {
+                            info!(?e, "proxy handler error");
+                            let _ = resp::Response::from_html(
+                                resp::Status::InternalServerError,
+                                "Internal server error",
+                            )
+                            .write(&mut stream)
+                            .await;
+                        }
+                    }
+                }
                 Err(e) => {
                     info!(?e, "failed to parse request");
+                    let _ = resp::Response::from_html(resp::Status::BadRequest, "Bad Request")
+                        .write(&mut stream)
+                        .await;
                 }
-            }
-
-            let resp = resp::Response::from_html(resp::Status::NotFound, &not_found_html);
-
-            if let Err(e) = resp.write(&mut stream).await {
-                info!(?e, "failed to write response");
             }
         });
     }
