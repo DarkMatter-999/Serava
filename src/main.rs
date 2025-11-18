@@ -1,5 +1,7 @@
-use axum::{response::Html, routing::get, Router, serve};
-use std::sync::Arc;
+use axum::{Router, response::Html, routing::get, serve};
+use reqwest::Client;
+use std::sync::{Arc, atomic::AtomicUsize};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 use tracing::info;
@@ -8,8 +10,8 @@ mod config;
 mod proxy;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<(dyn std::error::Error + 'static)>> {
-    tracing_subscriber::fmt::init();
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing_subscriber::fmt().init();
 
     let config_path = std::env::args()
         .nth(1)
@@ -29,32 +31,52 @@ async fn main() -> Result<(), Box<(dyn std::error::Error + 'static)>> {
         info!("backend[{}] = {}", i, b);
     }
 
-    let default_404 = include_str!("../static/404.html");
-    let not_found_html = Arc::new(match std::fs::read_to_string(cfg.static_dir.join("404.html")) {
-        Ok(s) => s,
-        Err(e) => {
+    let default_404 = include_str!("../static/404.html").to_string();
+    let not_found_html = Arc::new(
+        std::fs::read_to_string(cfg.static_dir.join("404.html")).unwrap_or_else(|e| {
             info!(
                 "failed to load {}/404.html: {}, falling back to embedded 404.html",
                 cfg.static_dir.display(),
                 e
             );
-            default_404.to_string()
-        }
-    });
+            default_404
+        }),
+    );
+
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(10)
+        .build()?;
 
     let state = proxy::AppState {
+        client,
         backends: cfg.backends.clone(),
+        counter: Arc::new(AtomicUsize::new(0)),
     };
 
+    let nf = not_found_html.clone();
+    let static_service =
+        ServeDir::new(&cfg.static_dir).fallback(get(move || async move { Html((*nf).clone()) }));
+
     let app = Router::new()
-        .nest_service("/static", ServeDir::new(&cfg.static_dir).fallback(get(move || async move { Html((*not_found_html).clone()) })))
+        .nest_service("/static", static_service)
         .fallback(proxy::proxy_handler)
         .with_state(state);
 
     let listener = TcpListener::bind(cfg.listen).await?;
     info!("listening on: {}", listener.local_addr()?);
 
-    serve(listener, app).await?;
+    let shutdown_signal = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("failed to install CTRL+C handler: {}", e);
+        }
+        info!("shutdown signal received");
+    };
+
+    serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
 
     Ok(())
 }
