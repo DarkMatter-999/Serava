@@ -1,14 +1,16 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderName, Request, Response, StatusCode},
+    http::{Request, Response, StatusCode},
 };
-use reqwest::Client;
+use reqwest::{Client, Body as ReqwestBody};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use url::Url;
+use futures::TryStreamExt;
+use std::io;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -17,86 +19,72 @@ pub struct AppState {
     pub counter: Arc<AtomicUsize>,
 }
 
-/// Hop-by-hop headers that must not be forwarded (RFC 7230 §6.1)
-fn is_hop_by_hop(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "host"
-    )
+// Use a static array for fast checking without allocating strings
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+];
+
+fn is_hop_by_hop(name: &str) -> bool {
+    HOP_BY_HOP_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(name))
 }
 
 pub async fn proxy_handler(
     State(state): State<AppState>,
-    request: Request<Body>,
+    req: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
-    // choose backend via round-robin
+    // Relaxed ordering is fine and fastest here.
     if state.backends.is_empty() {
         return Err(StatusCode::BAD_GATEWAY);
     }
-    let idx = state
-        .counter
-        .fetch_add(1, Ordering::Relaxed)
-        .wrapping_rem(state.backends.len());
+    let idx = state.counter.fetch_add(1, Ordering::Relaxed) % state.backends.len();
     let backend = &state.backends[idx];
 
-    let path_and_query = request
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let url = backend
-        .join(path_and_query)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let url = backend.join(path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let method = request.method().clone();
+    let method = req.method().clone();
     let mut req_builder = state.client.request(method, url);
 
-    // Copy headers, skip hop-by-hop.
-    for (name, value) in request.headers().iter() {
-        if !is_hop_by_hop(name) {
-            req_builder = req_builder.header(name, value.clone());
+    for (name, value) in req.headers() {
+        let name_str = name.as_str();
+        if !is_hop_by_hop(name_str) {
+            req_builder = req_builder.header(name, value);
         }
     }
 
-    // Collect body.
-    let body_bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-        .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    req_builder = req_builder.body(body_bytes);
+    // Convert Axum Body to Reqwest Body.
+    let client_body = req.into_body();
+    let stream = client_body.into_data_stream().map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, e)
+    });
+    req_builder = req_builder.body(ReqwestBody::wrap_stream(stream));
 
-    let resp = req_builder
-        .send()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let resp = req_builder.send().await.map_err(|e| {
+        tracing::error!("Upstream error: {}", e);
+        StatusCode::BAD_GATEWAY
+    })?;
 
-    // Build response.
-    let status = resp.status();
-    let mut response_builder = Response::builder().status(status.as_u16());
+    let mut response_builder = Response::builder().status(resp.status());
 
-    // Copy response headers.
-    for (name, value) in resp.headers().iter() {
-        if let Ok(header_name) = HeaderName::from_bytes(name.as_str().as_bytes()) {
-            if !is_hop_by_hop(&header_name) {
-                response_builder = response_builder.header(name, value.clone());
-            }
-        } else {
-            // Skip invalid header names.
-            continue;
+    for (name, value) in resp.headers() {
+        if !is_hop_by_hop(name.as_str()) {
+            response_builder = response_builder.header(name, value);
         }
     }
 
-    let body_bytes = resp.bytes().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let response = response_builder
-        .body(Body::from(body_bytes.to_vec()))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let upstream_stream = resp
+        .bytes_stream()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
 
-    Ok(response)
+    Ok(response_builder
+        .body(Body::from_stream(upstream_stream))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
 }
