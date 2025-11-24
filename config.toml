@@ -1,6 +1,8 @@
 [server]
 listen = "0.0.0.0:8080"
 static_dir = "./public"
+cert = "./certs/cert.pem"
+key = "./certs/key.pem"
 
 [proxy]
 backend = ["http://127.0.0.1:3000", "http://127.0.0.1:3001"]

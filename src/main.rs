@@ -1,8 +1,8 @@
-use axum::{Router, response::Html, routing::get, serve};
+use axum::{Router, response::Html, routing::get};
+use axum_server::tls_rustls::RustlsConfig;
 use reqwest::Client;
 use std::sync::{Arc, atomic::AtomicUsize};
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 use tracing::info;
 
@@ -11,6 +11,10 @@ mod proxy;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     tracing_subscriber::fmt().init();
 
     let config_path = std::env::args()
@@ -65,19 +69,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .fallback(proxy::proxy_handler)
         .with_state(state);
 
-    let listener = TcpListener::bind(cfg.listen).await?;
-    info!("listening on: {}", listener.local_addr()?);
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
 
-    let shutdown_signal = async {
+    tokio::spawn(async move {
         if let Err(e) = tokio::signal::ctrl_c().await {
             tracing::warn!("failed to install CTRL+C handler: {}", e);
         }
         info!("shutdown signal received");
-    };
+        // Wait 10 seconds for requests to finish
+        shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+    });
 
-    serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
-        .await?;
+    match cfg.tls {
+        Some(tls_files) => {
+            info!("TLS enabled");
+            info!("loading cert: {}", tls_files.cert.display());
+            info!("loading key: {}", tls_files.key.display());
+
+            let tls_config = RustlsConfig::from_pem_file(tls_files.cert, tls_files.key).await?;
+
+            info!("listening securely on https://{}", cfg.listen);
+
+            axum_server::bind_rustls(cfg.listen, tls_config)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        None => {
+            info!("TLS disabled (cert/key not present in config)");
+            info!("listening on http://{}", cfg.listen);
+
+            axum_server::bind(cfg.listen)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+    }
 
     Ok(())
 }

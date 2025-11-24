@@ -12,6 +12,8 @@ pub struct RawConfig {
 pub struct RawServer {
     pub listen: String,
     pub static_dir: PathBuf,
+    pub cert: Option<PathBuf>,
+    pub key: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,12 +28,19 @@ pub struct RawProxy {
     pub backend: BackendField,
 }
 
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
 /// Validated runtime config
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen: SocketAddr,
     pub static_dir: PathBuf,
     pub backends: Vec<Url>,
+    pub tls: Option<TlsConfig>,
 }
 
 #[derive(Debug)]
@@ -42,6 +51,8 @@ pub enum ValidationError {
     NoBackendsConfigured,
     InvalidBackendUrl(String, String),
     UnsupportedBackendScheme(String),
+    TlsFileNotFound(String),
+    IncompleteTlsConfig,
 }
 
 impl std::fmt::Display for ValidationError {
@@ -63,6 +74,12 @@ impl std::fmt::Display for ValidationError {
                 "unsupported backend scheme '{}', only http/https allowed",
                 scheme
             ),
+            ValidationError::TlsFileNotFound(path) => {
+                write!(f, "TLS file not found: {}", path)
+            }
+            ValidationError::IncompleteTlsConfig => {
+                write!(f, "Both 'cert' and 'key' must be provided for TLS")
+            }
         }
     }
 }
@@ -87,6 +104,20 @@ impl RawConfig {
                 static_dir.display().to_string(),
             ));
         }
+
+        let tls = match (self.server.cert, self.server.key) {
+            (Some(cert), Some(key)) => {
+                if !cert.exists() {
+                    return Err(ValidationError::TlsFileNotFound(cert.display().to_string()));
+                }
+                if !key.exists() {
+                    return Err(ValidationError::TlsFileNotFound(key.display().to_string()));
+                }
+                Some(TlsConfig { cert, key })
+            }
+            (None, None) => None,
+            _ => return Err(ValidationError::IncompleteTlsConfig),
+        };
 
         let backend_strings: Vec<String> = match self.proxy.backend {
             BackendField::Single(s) => vec![s],
@@ -114,6 +145,7 @@ impl RawConfig {
             listen,
             static_dir,
             backends,
+            tls,
         })
     }
 }

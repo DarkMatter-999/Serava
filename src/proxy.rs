@@ -3,14 +3,14 @@ use axum::{
     extract::State,
     http::{Request, Response, StatusCode},
 };
-use reqwest::{Client, Body as ReqwestBody};
+use futures::TryStreamExt;
+use reqwest::{Body as ReqwestBody, Client};
+use std::io;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use url::Url;
-use futures::TryStreamExt;
-use std::io;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,7 +33,9 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 ];
 
 fn is_hop_by_hop(name: &str) -> bool {
-    HOP_BY_HOP_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(name))
+    HOP_BY_HOP_HEADERS
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(name))
 }
 
 pub async fn proxy_handler(
@@ -47,8 +49,14 @@ pub async fn proxy_handler(
     let idx = state.counter.fetch_add(1, Ordering::Relaxed) % state.backends.len();
     let backend = &state.backends[idx];
 
-    let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let url = backend.join(path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let url = backend
+        .join(path)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let method = req.method().clone();
     let mut req_builder = state.client.request(method, url);
@@ -62,9 +70,9 @@ pub async fn proxy_handler(
 
     // Convert Axum Body to Reqwest Body.
     let client_body = req.into_body();
-    let stream = client_body.into_data_stream().map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, e)
-    });
+    let stream = client_body
+        .into_data_stream()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
     req_builder = req_builder.body(ReqwestBody::wrap_stream(stream));
 
     let resp = req_builder.send().await.map_err(|e| {
