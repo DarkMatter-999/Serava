@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         client,
         backends: cfg.backends.clone(),
         counter: Arc::new(AtomicUsize::new(0)),
+        backend_timeout: cfg.backend_timeout,
     };
 
     let nf = not_found_html.clone();

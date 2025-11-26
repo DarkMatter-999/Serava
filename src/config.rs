@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use url::Url;
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +26,7 @@ pub enum BackendField {
 #[derive(Debug, Deserialize)]
 pub struct RawProxy {
     pub backend: BackendField,
+    pub backend_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,7 @@ pub struct Config {
     pub static_dir: PathBuf,
     pub backends: Vec<Url>,
     pub tls: Option<TlsConfig>,
+    pub backend_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -141,11 +143,17 @@ impl RawConfig {
             }
         }
 
+        let backend_timeout = match self.proxy.backend_timeout_secs {
+            Some(s) => Duration::from_secs(s),
+            None => Duration::from_secs(30),
+        };
+
         Ok(Config {
             listen,
             static_dir,
             backends,
             tls,
+            backend_timeout,
         })
     }
 }

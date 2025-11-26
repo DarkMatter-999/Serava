@@ -5,4 +5,5 @@ cert = "./certs/cert.pem"
 key = "./certs/key.pem"
 
 [proxy]
+backend_timeout_secs = 30
 backend = ["http://127.0.0.1:3000", "http://127.0.0.1:3001"]
