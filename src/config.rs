@@ -27,6 +27,9 @@ pub enum BackendField {
 pub struct RawProxy {
     pub backend: BackendField,
     pub backend_timeout_secs: Option<u64>,
+    pub rate_limit_per_minute: Option<u64>,
+    pub rate_limit_burst: Option<u64>,
+    pub max_request_size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +46,9 @@ pub struct Config {
     pub backends: Vec<Url>,
     pub tls: Option<TlsConfig>,
     pub backend_timeout: Duration,
+    pub rate_limit_per_minute: u64,
+    pub rate_limit_burst: u64,
+    pub max_request_size_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -143,10 +149,14 @@ impl RawConfig {
             }
         }
 
-        let backend_timeout = match self.proxy.backend_timeout_secs {
-            Some(s) => Duration::from_secs(s),
-            None => Duration::from_secs(30),
-        };
+        let backend_timeout =
+            std::time::Duration::from_secs(self.proxy.backend_timeout_secs.unwrap_or(30));
+        let rate_limit_per_minute = self.proxy.rate_limit_per_minute.unwrap_or(600);
+        let rate_limit_burst = self.proxy.rate_limit_burst.unwrap_or(100);
+        let max_request_size_bytes = self
+            .proxy
+            .max_request_size_bytes
+            .unwrap_or(10 * 1024 * 1024);
 
         Ok(Config {
             listen,
@@ -154,6 +164,9 @@ impl RawConfig {
             backends,
             tls,
             backend_timeout,
+            rate_limit_per_minute,
+            rate_limit_burst,
+            max_request_size_bytes,
         })
     }
 }

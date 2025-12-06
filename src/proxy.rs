@@ -1,7 +1,10 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, Response, StatusCode, header::{HeaderName, HeaderValue}},
+    http::{
+        Request, Response, StatusCode,
+        header::{HeaderName, HeaderValue},
+    },
 };
 use futures::TryStreamExt;
 use reqwest::{Body as ReqwestBody, Client};
@@ -14,12 +17,23 @@ use std::time::Duration;
 use tokio::time::timeout;
 use url::Url;
 
+use dashmap::DashMap;
+use std::net::IpAddr;
+use std::time::Instant;
+
+/// Application shared state.
 #[derive(Clone)]
 pub struct AppState {
     pub client: Client,
     pub backends: Vec<Url>,
     pub counter: Arc<AtomicUsize>,
     pub backend_timeout: Duration,
+
+    // Per-IP in-memory token buckets (tokens, last_seen)
+    // This is used as an in-process rate limiter.
+    pub rate_limit_map: Arc<DashMap<IpAddr, (f64, Instant)>>,
+    pub rate_limit_per_minute: f64,
+    pub rate_limit_burst: f64,
 }
 
 // Use a static array for fast checking without allocating strings
@@ -66,7 +80,11 @@ fn sanitize_and_forward_headers(
 
         // Validate header value length
         if raw.len() > 16 * 1024 {
-            tracing::warn!("dropping header {}: value too long ({} bytes)", name_str, raw.len());
+            tracing::warn!(
+                "dropping header {}: value too long ({} bytes)",
+                name_str,
+                raw.len()
+            );
             continue;
         }
 
@@ -103,7 +121,10 @@ fn sanitize_and_forward_headers(
                     rb = rb.header(hn, hv);
                 }
                 Err(_) => {
-                    tracing::warn!("dropping header {}: invalid value after sanitization", name_str);
+                    tracing::warn!(
+                        "dropping header {}: invalid value after sanitization",
+                        name_str
+                    );
                     continue;
                 }
             }
@@ -116,6 +137,70 @@ fn sanitize_and_forward_headers(
     rb
 }
 
+fn check_rate_limit(state: &AppState, req: &Request<Body>) -> Result<(), StatusCode> {
+    let mut client_ip_opt: Option<IpAddr> = None;
+
+    // 1) X-Forwarded-For header (take the first IP)
+    if let Some(xff) = req.headers().get("x-forwarded-for") {
+        if let Ok(s) = std::str::from_utf8(xff.as_bytes()) {
+            if let Some(first) = s.split(',').next() {
+                if let Ok(ip) = first.trim().parse::<IpAddr>() {
+                    client_ip_opt = Some(ip);
+                }
+            }
+        }
+    }
+
+    // 2) axum ConnectInfo (if present)
+    if client_ip_opt.is_none() {
+        if let Some(ci) = req
+            .extensions()
+            .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
+        {
+            client_ip_opt = Some(ci.0.ip());
+        }
+    }
+
+    // 3) fallback to raw SocketAddr in extensions
+    if client_ip_opt.is_none() {
+        if let Some(sock) = req.extensions().get::<std::net::SocketAddr>() {
+            client_ip_opt = Some(sock.ip());
+        }
+    }
+
+    let ip = match client_ip_opt {
+        Some(ip) => ip,
+        None => return Ok(()), // Can't attribute an IP; allow the request
+    };
+
+    let now = Instant::now();
+    let rate_per_sec = state.rate_limit_per_minute / 60.0;
+    let burst = state.rate_limit_burst;
+
+    // Update or insert token bucket for this IP
+    // Initialize new entries with 0 tokens to avoid allowing a large initial burst.
+    let mut allowed = false;
+    {
+        // When inserting a fresh bucket, start with 0.0 tokens and last-seen = now.
+        // Existing entries will be topped up based on elapsed time below.
+        let mut entry = state.rate_limit_map.entry(ip).or_insert((0.0, now));
+        let elapsed = now.duration_since(entry.1).as_secs_f64();
+        entry.0 = (entry.0 + elapsed * rate_per_sec).min(burst);
+        entry.1 = now;
+        if entry.0 >= 1.0 {
+            entry.0 -= 1.0;
+            allowed = true;
+        }
+    }
+
+    if allowed {
+        Ok(())
+    } else {
+        tracing::debug!("rate limit exceeded for {}", ip);
+        Err(StatusCode::TOO_MANY_REQUESTS)
+    }
+}
+
 pub async fn proxy_handler(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -124,6 +209,12 @@ pub async fn proxy_handler(
     if state.backends.is_empty() {
         return Err(StatusCode::BAD_GATEWAY);
     }
+
+    if let Err(status) = check_rate_limit(&state, &req) {
+        tracing::warn!("rate limited request from client");
+        return Err(status);
+    }
+
     let idx = state.counter.fetch_add(1, Ordering::Relaxed) % state.backends.len();
     let backend = &state.backends[idx];
 
@@ -158,7 +249,10 @@ pub async fn proxy_handler(
             return Err(StatusCode::BAD_GATEWAY);
         }
         Err(_) => {
-            tracing::warn!("upstream request timed out after {:?}", state.backend_timeout);
+            tracing::warn!(
+                "upstream request timed out after {:?}",
+                state.backend_timeout
+            );
             return Err(StatusCode::GATEWAY_TIMEOUT);
         }
     };

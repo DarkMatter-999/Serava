@@ -1,9 +1,10 @@
 use axum::{Router, response::Html, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
+use dashmap::DashMap;
 use reqwest::Client;
 use std::sync::{Arc, atomic::AtomicUsize};
 use std::time::Duration;
-use tower_http::services::ServeDir;
+use tower_http::{limit::RequestBodyLimitLayer, services::ServeDir};
 use tracing::info;
 
 mod config;
@@ -54,11 +55,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
+    let burst_value = if cfg.rate_limit_burst == 0 {
+        cfg.rate_limit_per_minute
+    } else {
+        cfg.rate_limit_burst
+    };
+
     let state = proxy::AppState {
         client,
         backends: cfg.backends.clone(),
         counter: Arc::new(AtomicUsize::new(0)),
         backend_timeout: cfg.backend_timeout,
+        rate_limit_map: Arc::new(DashMap::new()),
+        rate_limit_per_minute: cfg.rate_limit_per_minute as f64,
+        rate_limit_burst: burst_value as f64,
     };
 
     let nf = not_found_html.clone();
@@ -68,6 +78,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = Router::new()
         .nest_service("/static", static_service)
         .fallback(proxy::proxy_handler)
+        .layer(RequestBodyLimitLayer::new(
+            cfg.max_request_size_bytes as usize,
+        ))
         .with_state(state);
 
     let handle = axum_server::Handle::new();
@@ -94,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             axum_server::bind_rustls(cfg.listen, tls_config)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
         }
         None => {
@@ -103,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             axum_server::bind(cfg.listen)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
         }
     }
