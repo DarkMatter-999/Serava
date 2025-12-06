@@ -46,8 +46,8 @@ pub struct Config {
     pub backends: Vec<Url>,
     pub tls: Option<TlsConfig>,
     pub backend_timeout: Duration,
-    pub rate_limit_per_minute: u64,
-    pub rate_limit_burst: u64,
+    pub rate_limit_per_minute: Option<u64>,
+    pub rate_limit_burst: Option<u64>,
     pub max_request_size_bytes: u64,
 }
 
@@ -151,8 +151,8 @@ impl RawConfig {
 
         let backend_timeout =
             std::time::Duration::from_secs(self.proxy.backend_timeout_secs.unwrap_or(30));
-        let rate_limit_per_minute = self.proxy.rate_limit_per_minute.unwrap_or(600);
-        let rate_limit_burst = self.proxy.rate_limit_burst.unwrap_or(100);
+        let rate_limit_per_minute = self.proxy.rate_limit_per_minute;
+        let rate_limit_burst = self.proxy.rate_limit_burst;
         let max_request_size_bytes = self
             .proxy
             .max_request_size_bytes

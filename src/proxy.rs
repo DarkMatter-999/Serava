@@ -32,8 +32,8 @@ pub struct AppState {
     // Per-IP in-memory token buckets (tokens, last_seen)
     // This is used as an in-process rate limiter.
     pub rate_limit_map: Arc<DashMap<IpAddr, (f64, Instant)>>,
-    pub rate_limit_per_minute: f64,
-    pub rate_limit_burst: f64,
+    pub rate_limit_per_minute: Option<f64>,
+    pub rate_limit_burst: Option<f64>,
 }
 
 // Use a static array for fast checking without allocating strings
@@ -138,6 +138,11 @@ fn sanitize_and_forward_headers(
 }
 
 fn check_rate_limit(state: &AppState, req: &Request<Body>) -> Result<(), StatusCode> {
+    // Check if rate limiting is disabled.
+    if state.rate_limit_per_minute.is_none() {
+        return Ok(());
+    }
+
     let mut client_ip_opt: Option<IpAddr> = None;
 
     // 1) X-Forwarded-For header (take the first IP)
@@ -174,8 +179,10 @@ fn check_rate_limit(state: &AppState, req: &Request<Body>) -> Result<(), StatusC
     };
 
     let now = Instant::now();
-    let rate_per_sec = state.rate_limit_per_minute / 60.0;
-    let burst = state.rate_limit_burst;
+
+    let per_min = state.rate_limit_per_minute.unwrap();
+    let rate_per_sec = per_min / 60.0;
+    let burst = state.rate_limit_burst.unwrap_or(per_min);
 
     // Update or insert token bucket for this IP
     // Initialize new entries with 0 tokens to avoid allowing a large initial burst.
