@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     extract::State,
     http::{
-        Request, Response, StatusCode,
+        Method, Request, Response, StatusCode,
         header::{HeaderName, HeaderValue},
     },
 };
@@ -17,9 +17,20 @@ use std::time::Duration;
 use tokio::time::timeout;
 use url::Url;
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use std::net::IpAddr;
 use std::time::Instant;
+
+/// Cached response entry (stored in the in-memory cache)
+#[derive(Clone)]
+pub struct CacheEntry {
+    pub status: u16,
+    pub headers: Vec<(String, Vec<u8>)>,
+    pub body: Bytes,
+    pub expires_at: Instant,
+    pub size: usize,
+}
 
 /// Application shared state.
 #[derive(Clone)]
@@ -34,6 +45,13 @@ pub struct AppState {
     pub rate_limit_map: Arc<DashMap<IpAddr, (f64, Instant)>>,
     pub rate_limit_per_minute: Option<f64>,
     pub rate_limit_burst: Option<f64>,
+
+    // Response cache using DashMap for simple concurrent in-memory caching
+    pub response_cache: Option<Arc<DashMap<String, CacheEntry>>>,
+    pub cache_ttl_secs: Option<u64>,
+    pub cache_max_size_bytes: Option<usize>,
+    // Current approximate cache size (sum of stored body sizes). Used for eviction.
+    pub cache_current_size: Arc<AtomicUsize>,
 }
 
 // Use a static array for fast checking without allocating strings
@@ -222,6 +240,33 @@ pub async fn proxy_handler(
         return Err(status);
     }
 
+    // Build a simple cache key using method + absolute URI (includes query)
+    let cache_key = format!("{} {}", req.method(), req.uri().to_string());
+
+    // If a response cache is configured (DashMap), check it first.
+    if let Some(cache) = &state.response_cache {
+        if let Some(entry_ref) = cache.get(&cache_key) {
+            // If cached and still fresh, serve it immediately.
+            if Instant::now() < entry_ref.expires_at {
+                let mut response_builder = Response::builder().status(entry_ref.status);
+                for (name, val) in &entry_ref.headers {
+                    if let Ok(hn) = HeaderName::from_bytes(name.as_bytes()) {
+                        if let Ok(hv) = HeaderValue::from_bytes(val) {
+                            response_builder = response_builder.header(hn, hv);
+                        }
+                    }
+                }
+                let resp = response_builder
+                    .body(Body::from(entry_ref.body.clone()))
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                return Ok(resp);
+            } else {
+                // expired -> remove it
+                cache.remove(&cache_key);
+            }
+        }
+    }
+
     let idx = state.counter.fetch_add(1, Ordering::Relaxed) % state.backends.len();
     let backend = &state.backends[idx];
 
@@ -233,6 +278,8 @@ pub async fn proxy_handler(
     let url = backend
         .join(path)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let is_get = req.method() == &Method::GET;
 
     let method = req.method().clone();
     let mut req_builder = state.client.request(method, url);
@@ -266,17 +313,128 @@ pub async fn proxy_handler(
 
     let mut response_builder = Response::builder().status(resp.status());
 
+    let mut resp_headers: Vec<(String, Vec<u8>)> = Vec::new();
     for (name, value) in resp.headers() {
         if !is_hop_by_hop(name.as_str()) {
             response_builder = response_builder.header(name, value);
+            resp_headers.push((name.to_string(), value.as_bytes().to_vec()));
         }
     }
 
-    let upstream_stream = resp
-        .bytes_stream()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+    // Helper: robustly parse Cache-Control header bytes and return (s_maxage, max_age, no_store_or_no_cache)
+    fn parse_cache_control_bytes(hv: &[u8]) -> (Option<u64>, Option<u64>, bool) {
+        if let Ok(s) = std::str::from_utf8(hv) {
+            let mut s_maxage: Option<u64> = None;
+            let mut maxage: Option<u64> = None;
+            let mut no_store_or_no_cache = false;
+            for part in s.split(',') {
+                let p = part.trim();
+                // accept quoted values and spaces: split on '=' only once
+                if p.eq_ignore_ascii_case("no-store") || p.eq_ignore_ascii_case("no-cache") {
+                    no_store_or_no_cache = true;
+                    continue;
+                }
+                if let Some(rest) = p.splitn(2, '=').nth(1) {
+                    let k = p.splitn(2, '=').next().unwrap_or("").trim();
+                    let v = rest.trim().trim_matches('"');
+                    if k.eq_ignore_ascii_case("s-maxage") {
+                        if let Ok(n) = v.parse::<u64>() {
+                            s_maxage = Some(n);
+                        }
+                    } else if k.eq_ignore_ascii_case("max-age") {
+                        if let Ok(n) = v.parse::<u64>() {
+                            maxage = Some(n);
+                        }
+                    }
+                }
+            }
+            return (s_maxage, maxage, no_store_or_no_cache);
+        }
+        (None, None, false)
+    }
 
-    Ok(response_builder
-        .body(Body::from_stream(upstream_stream))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+    // Resolve TTL and cacheability from headers and config.
+    // Prefer s-maxage, then max-age, then configured default TTL.
+    let mut ttl_seconds: Option<u64> = None;
+    let mut backend_forbids_cache = false;
+    if let Some((_, hv)) = resp_headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("cache-control"))
+    {
+        let (s_max, max_a, no_store) = parse_cache_control_bytes(hv);
+        backend_forbids_cache = no_store;
+        ttl_seconds = s_max.or(max_a);
+    }
+    if ttl_seconds.is_none() {
+        ttl_seconds = state.cache_ttl_secs;
+    }
+
+    // Only consider caching for GET requests, successful 200 responses, cache enabled, and not forbidden.
+    let should_cache = is_get
+        && resp.status().as_u16() == 200
+        && !backend_forbids_cache
+        && ttl_seconds.is_some()
+        && state.response_cache.is_some();
+
+    if should_cache {
+        // We need to buffer the body for caching
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("error reading upstream body for caching: {}", e);
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+        };
+
+        // Build response to return to client
+        let response = response_builder
+            .body(Body::from(bytes.clone()))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // Insert into cache
+        if let (Some(cache), Some(ttl)) = (state.response_cache.as_ref(), ttl_seconds) {
+            let size = bytes.len();
+            let expires_at = Instant::now() + Duration::from_secs(ttl);
+            let entry = CacheEntry {
+                status: response.status().as_u16(),
+                headers: resp_headers.clone(),
+                body: Bytes::from(bytes.clone()),
+                expires_at,
+                size,
+            };
+            cache.insert(cache_key.clone(), entry);
+            state.cache_current_size.fetch_add(size, Ordering::Relaxed);
+
+            // Evict if cache exceeds configured max size (best-effort).
+            if let Some(max_bytes) = state.cache_max_size_bytes {
+                // Collect items and evict oldest expirations first.
+                let mut items: Vec<(String, Instant, usize)> = cache
+                    .iter()
+                    .map(|r| (r.key().clone(), r.value().expires_at, r.value().size))
+                    .collect();
+                items.sort_by_key(|t| t.1);
+                let mut cur_total = state.cache_current_size.load(Ordering::Relaxed);
+                for (k, _exp, _sz) in items {
+                    if cur_total as u64 <= max_bytes as u64 {
+                        break;
+                    }
+                    if let Some(removed) = cache.remove(&k) {
+                        cur_total = cur_total.saturating_sub(removed.1.size);
+                        state
+                            .cache_current_size
+                            .fetch_sub(removed.1.size, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        return Ok(response);
+    } else {
+        let upstream_stream = resp
+            .bytes_stream()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+        let streamed = response_builder
+            .body(Body::from_stream(upstream_stream))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(streamed);
+    }
 }

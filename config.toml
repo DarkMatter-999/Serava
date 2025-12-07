@@ -12,3 +12,7 @@ max_request_size_bytes = 10485760
 rate_limit_per_minute = 60000
 rate_limit_burst = 100000
 backend = ["http://127.0.0.1:3000", "http://127.0.0.1:3001"]
+# If `cache_ttl_secs` is omitted, caching is disabled. If provided, backend `Cache-Control: max-age=N` will override this value.
+cache_ttl_secs = 60
+# Maximum total in-memory cache size in bytes. When omitted, no size-based eviction limit is enforced.
+cache_max_size_bytes = 10485760

@@ -30,6 +30,8 @@ pub struct RawProxy {
     pub rate_limit_per_minute: Option<u64>,
     pub rate_limit_burst: Option<u64>,
     pub max_request_size_bytes: Option<u64>,
+    pub cache_ttl_secs: Option<u64>,
+    pub cache_max_size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +51,8 @@ pub struct Config {
     pub rate_limit_per_minute: Option<u64>,
     pub rate_limit_burst: Option<u64>,
     pub max_request_size_bytes: u64,
+    pub cache_ttl_secs: Option<u64>,
+    pub cache_max_size_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -158,6 +162,9 @@ impl RawConfig {
             .max_request_size_bytes
             .unwrap_or(10 * 1024 * 1024);
 
+        let cache_ttl_secs = self.proxy.cache_ttl_secs;
+        let cache_max_size_bytes = self.proxy.cache_max_size_bytes;
+
         Ok(Config {
             listen,
             static_dir,
@@ -167,6 +174,8 @@ impl RawConfig {
             rate_limit_per_minute,
             rate_limit_burst,
             max_request_size_bytes,
+            cache_ttl_secs,
+            cache_max_size_bytes,
         })
     }
 }

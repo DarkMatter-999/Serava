@@ -55,6 +55,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
+    let response_cache = if let Some(ttl) = cfg.cache_ttl_secs {
+        if ttl == 0 {
+            tracing::info!("response caching disabled (ttl=0)");
+            None
+        } else {
+            tracing::info!(
+                "response caching enabled: ttl={}s, max_size_bytes={:?}",
+                ttl,
+                cfg.cache_max_size_bytes
+            );
+            Some(Arc::new(DashMap::new()))
+        }
+    } else {
+        tracing::info!("response caching disabled");
+        None
+    };
+
     let state = proxy::AppState {
         client,
         backends: cfg.backends.clone(),
@@ -66,6 +83,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .rate_limit_burst
             .map(|v| v as f64)
             .or(cfg.rate_limit_per_minute.map(|p| p as f64)),
+        response_cache,
+        cache_ttl_secs: cfg.cache_ttl_secs,
+        cache_max_size_bytes: cfg.cache_max_size_bytes.map(|v| v as usize),
+        cache_current_size: Arc::new(AtomicUsize::new(0)),
     };
 
     let nf = not_found_html.clone();
