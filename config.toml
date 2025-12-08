@@ -1,10 +1,10 @@
-[server]
+[[servers]]
 listen = "0.0.0.0:8080"
 static_dir = "./public"
 cert = "./certs/cert.pem"
 key = "./certs/key.pem"
 
-[proxy]
+[servers.proxy]
 backend_timeout_secs = 30
 # Maximum allowed request body size in bytes (default 10 MiB)
 max_request_size_bytes = 10485760
@@ -16,3 +16,11 @@ backend = ["http://127.0.0.1:3000", "http://127.0.0.1:3001"]
 cache_ttl_secs = 60
 # Maximum total in-memory cache size in bytes. When omitted, no size-based eviction limit is enforced.
 cache_max_size_bytes = 10485760
+
+[[servers]]
+listen = "0.0.0.0:9090"
+static_dir = "./public"
+
+[servers.proxy]
+backend = ["http://127.0.0.1:4000"]
+max_request_size_bytes = 5242880
